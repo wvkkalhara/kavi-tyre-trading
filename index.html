@@ -100,6 +100,11 @@
     .inv-wrap{padding:0}
     @page{size:A4;margin:12mm}
   }
+  /* 58/80mm receipt printers: no margins, full paper width */
+  @media print{
+    body.print-thermal .thermal-slip{max-width:none!important;width:100%!important;padding:0!important}
+  }
+  @page thermal{size:80mm auto;margin:3mm}
   .inv-table{width:100%;border-collapse:collapse}
   .inv-table th,.inv-table td{border-bottom:1px solid #d4d4d8;padding:7px 6px;font-size:12px;text-align:left}
   .inv-table th{background:#f4f4f5;font-size:10px;text-transform:uppercase;letter-spacing:.06em}
@@ -485,8 +490,13 @@
 
     <!-- DATA / EXPORT -->
     <section id="view-data" class="view hidden px-4 pt-4">
-      <h1 class="font-display text-2xl font-bold tracking-tight">More</h1>
-      <p class="mt-0.5 text-xs font-medium text-zinc-500">Shop setup, sheets, backup &amp; tools</p>
+      <div class="flex items-end justify-between">
+        <div>
+          <h1 class="font-display text-2xl font-bold tracking-tight">More</h1>
+          <p class="mt-0.5 text-xs font-medium text-zinc-500">Shop setup, sheets, backup &amp; tools</p>
+        </div>
+        <button data-action="lock-again" class="press flex shrink-0 items-center gap-1.5 rounded-xl border border-amber-400/30 bg-amber-400/10 px-3 py-2 text-[12px] font-bold text-amber-300"><i data-lucide="lock" class="h-4 w-4"></i>Lock now</button>
+      </div>
 
       <div class="more-grid mt-5 space-y-3">
         <div class="grid grid-cols-2 gap-2.5">
@@ -718,7 +728,7 @@
   <script>document.getElementById('sheet').style.display='none'</script>
 
   <!-- TOASTS -->
-  <div id="toast-root" class="pointer-events-none fixed bottom-[104px] left-1/2 z-[60] flex w-full max-w-[430px] -translate-x-1/2 flex-col items-center gap-2 px-6" style="bottom:calc(104px + env(safe-area-inset-bottom))"></div>
+  <div id="toast-root" class="pointer-events-none fixed bottom-[104px] left-1/2 z-[90] flex w-full max-w-[430px] -translate-x-1/2 flex-col items-center gap-2 px-6" style="bottom:calc(104px + env(safe-area-inset-bottom))"></div>
 </div>
 
 <!-- ═══════════ AI TYRE SCANNER OVERLAY ═══════════ -->
@@ -872,7 +882,9 @@ function removeCustom(kind,val){
   save(); renderCatChips(); renderTypeChips(); renderOptionManager(); renderStockList();
   toast(`${val} removed`,'info');
 }
-const ERASE_PASSWORD = 'Kavi@1231';   // owner password required to erase all data
+/* owner password — case-insensitive so Kavi@1231 / kavi@1231 both work */
+const OWNER_PASSWORD = 'kavi@1231';
+let   lockedUntil = 0;                // timestamp until which More stays unlocked (session-style)
 const AV_COLORS = ['#f59e0b','#38bdf8','#a78bfa','#34d399','#f472b6','#fb7185','#fbbf24','#4ade80'];
 
 let state = {
@@ -889,6 +901,53 @@ function snapshot(){
   return { items:state.items, txns:state.txns, sales:state.sales,
            services:state.services, expenses:state.expenses, settings:state.settings };
 }
+/* Firebase refuses any `undefined` value — strip them so a single bad field
+   can never break syncing for the whole shop. Also caps runaway history. */
+function stripUndef(v){
+  if(Array.isArray(v)) return v.filter(x=>x!==undefined).map(stripUndef);
+  if(v && typeof v==='object'){
+    const o={};
+    Object.keys(v).forEach(k=>{
+      const val=v[k];
+      if(val===undefined) return;
+      if(typeof val==='number' && !isFinite(val)){ o[k]=0; return; }
+      o[k]=stripUndef(val);
+    });
+    return o;
+  }
+  if(typeof v==='number' && !isFinite(v)) return 0;
+  return v;
+}
+/* make sure every collection exists, even after an old/partial cloud payload */
+function normalizeState(){
+  if(!Array.isArray(state.items))    state.items=[];
+  if(!Array.isArray(state.txns))     state.txns=[];
+  if(!Array.isArray(state.sales))    state.sales=[];
+  if(!Array.isArray(state.expenses)) state.expenses=[];
+  if(!Array.isArray(state.services)) state.services=[];
+  if(!state.settings || typeof state.settings!=='object') state.settings={currency:'Rs',invSeq:0};
+  if(!state.settings.currency) state.settings.currency='Rs';
+  if(typeof state.settings.invSeq!=='number') state.settings.invSeq=0;
+  state.settings.shop = Object.assign(
+    {name:'Kavi Tyre Trading',address:'',phone:'',wacode:'94',prefix:'KATT',printer:'a4',bank:'',footer:'Thank you for your business!'},
+    state.settings.shop||{});
+  if(state.settings.shop.prefix==='KTT') state.settings.shop.prefix='KATT';
+  if(state.settings.xCats && !Array.isArray(state.settings.xCats)) state.settings.xCats=[];
+  if(state.settings.xTypes && !Array.isArray(state.settings.xTypes)) state.settings.xTypes=[];
+  state.items.forEach(migrateItem);
+  /* invoice counter can never go backwards → no duplicate invoice numbers */
+  let maxSeq=state.settings.invSeq||0;
+  state.sales.forEach(s=>{ const m=String(s.no||'').match(/(\d+)\s*$/); if(m) maxSeq=Math.max(maxSeq,+m[1]); });
+  state.settings.invSeq=Math.max(state.settings.invSeq||0, maxSeq);
+  /* seed the starter services exactly once — after that the user's list is law,
+     even if they deliberately delete every service */
+  if(!state.settings.svcSeeded){
+    state.settings.svcSeeded=true;
+    if(!Array.isArray(state.services)||!state.services.length) state.services=DEFAULT_SERVICES.slice();
+  }
+  /* keep the activity log from growing forever (bills & stock are never trimmed) */
+  if(state.txns.length>4000) state.txns=state.txns.slice(0,4000);
+}
 let addType = 'Car';
 let editType = 'Car';
 let addCat  = 'Tyre';
@@ -902,9 +961,14 @@ const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt
 const num = n => (Number(n)||0).toLocaleString('en-US');
 const money = n => `${state.settings.currency} ${num(Math.round(Number(n)||0))}`;
 
+let lsWarned=false;   // warn about blocked/full storage once, not on every save
 function save(){
   state.settings.mtime = Date.now();
-  try{ localStorage.setItem(LS_KEY, JSON.stringify(snapshot())); }catch(e){}
+  try{ localStorage.setItem(LS_KEY, JSON.stringify(snapshot())); }
+  catch(e){
+    if(!lsWarned){ lsWarned=true; toast('Storage is full or blocked — data may not save. Download a backup now','err'); }
+    else if(window.console) console.warn('localStorage save failed:', e && e.message);
+  }
   fbPushDebounced();
 }
 function load(){
@@ -914,13 +978,11 @@ function load(){
     const d = JSON.parse(raw);
     state.items = d.items||[]; state.txns = d.txns||[]; state.sales = d.sales||[];
     state.expenses = d.expenses||[];
-    state.services = (d.services&&d.services.length)?d.services:DEFAULT_SERVICES.slice();
+    if(Array.isArray(d.services)) state.services=d.services;   // empty list stays empty
     state.settings = Object.assign({currency:'Rs', invSeq:0}, d.settings||{});
-    state.settings.shop = Object.assign({name:'Kavi Tyre Trading',address:'',phone:'',wacode:'94',prefix:'KATT',footer:'Thank you for your business!'}, state.settings.shop||{});
-    if(state.settings.shop.prefix==='KTT') state.settings.shop.prefix='KATT';
-    state.items.forEach(migrateItem);
+    normalizeState();
     return true;
-  }catch(e){ return false; }
+  }catch(e){ normalizeState(); return false; }
 }
 
 /* ═══════════════════════ HELPERS ═══════════════════════ */
@@ -1024,6 +1086,9 @@ function toast(msg, kind){
 
 /* ═══════════════════════ NAVIGATION ═══════════════════════ */
 function setView(v){
+  /* safety net: never render the More screen while it is locked,
+     even if some code path calls setView('data') directly */
+  if(v==='data' && !isUnlocked()){ openLockSheet('data'); return; }
   state.ui.view = v;
   ['dashboard','stock','add','history','data','pos','sales'].forEach(name=>$('view-'+name).classList.toggle('hidden', name!==v));
   document.querySelectorAll('[data-nav]').forEach(b=>{
@@ -1043,11 +1108,11 @@ function setView(v){
   if(v==='data'){ $('pref-currency').value = state.settings.currency; fillShopForm(); renderServices(); renderOptionManager(); renderExpenses(); }
   refreshIcons();
 }
-function setFilter(f){ state.ui.stockFilter=f; keepStockOrder=false; renderStockList(); }
-function clearQuery(){ state.ui.query=''; keepStockOrder=false; const el=$('stock-search'); if(el) el.value=''; renderStockList(); }
+function setFilter(f){ state.ui.stockFilter=f; keepStockOrder=false; stockLimit=60; renderStockList(); }
+function clearQuery(){ state.ui.query=''; keepStockOrder=false; stockLimit=60; const el=$('stock-search'); if(el) el.value=''; renderStockList(); }
 function setHFilter(f){ state.ui.histFilter=f; renderHistory(); }
-function setQuery(q){ state.ui.query=q; keepStockOrder=false; renderStockList(); }
-function setSort(v){ state.ui.sort=v; keepStockOrder=false; renderStockList(); }
+function setQuery(q){ state.ui.query=q; keepStockOrder=false; stockLimit=60; renderStockList(); }
+function setSort(v){ state.ui.sort=v; keepStockOrder=false; stockLimit=60; renderStockList(); }
 function setCurrency(v){
   const nv = v.trim()||'Rs';
   if(nv===state.settings.currency) return;
@@ -1333,6 +1398,7 @@ function sizeQueryHint(q){
 }
 /* ── stable stock list: quick adjusting never re-sorts the cards under your finger ── */
 let keepStockOrder=false, stockOrderIds=[];
+let stockLimit=60;
 let quickHoldTimer=null, quickHeld=false, quickSuppressClick=false, quickStat=null;
 
 function filteredStock(){
@@ -1427,9 +1493,16 @@ function renderStockList(){
   if(cl){ cl.classList.toggle('hidden', !q); cl.classList.toggle('grid', !!q); }
   updateStockHeader(items);
 
+  const visible = items.slice(0, stockLimit);
+  const remaining = items.length - visible.length;
   $('stock-list').className = 'mt-1 space-y-2.5 lg:grid lg:grid-cols-2 lg:gap-3 lg:space-y-0 xl:grid-cols-3';
-  $('stock-list').innerHTML = items.length ? items.map(stockCardHTML).join('') : `
-    <div class="rounded-3xl border border-dashed border-zinc-700 p-10 text-center">
+  $('stock-list').innerHTML = items.length ? (visible.map(stockCardHTML).join('') + (remaining > 0 ? `
+    <div class="col-span-full pt-2 pb-4 text-center">
+      <button data-action="stock-more" class="press rounded-2xl border border-zinc-700 bg-zinc-800/90 px-6 py-3 text-[13px] font-bold text-zinc-200 shadow-md">
+        Show ${Math.min(60, remaining)} more (${remaining} remaining)
+      </button>
+    </div>` : '')) : `
+    <div class="col-span-full rounded-3xl border border-dashed border-zinc-700 p-10 text-center">
       <i data-lucide="search-x" class="mx-auto h-8 w-8 text-zinc-600"></i>
       <p class="mt-3 font-display font-bold">Nothing found</p>
       <p class="mt-1 text-xs text-zinc-500">Try a different search or filter.</p>
@@ -1754,6 +1827,12 @@ function detailHTML(it){
       <div class="rounded-2xl border border-sky-400/25 bg-sky-400/[.07] p-3"><p class="tnum text-[13px] font-bold text-sky-300">${money(priceLow(it))}</p><p class="text-[10px] font-semibold text-zinc-500">Low price</p></div>
     </div>
     <p class="mt-3 text-[12px] font-medium text-zinc-500">${esc(catOf(it))} · ${esc(it.type)}${it.country?' · <span class="font-semibold text-zinc-300">'+esc(it.country)+'</span>':''}${it.warranty?' · Warranty: <span class="font-semibold text-emerald-300">'+esc(it.warranty)+'</span>':''}</p>
+    ${it.dot?(()=>{ const d=decodeDot(it.dot);
+      return d
+        ? `<p class="mt-1.5 flex items-center gap-1.5 rounded-xl border px-2.5 py-1.5 text-[11px] font-bold" style="border-color:${d.color}38;background:${d.color}14;color:${d.color}">
+             <i data-lucide="calendar-clock" class="h-3.5 w-3.5"></i>${esc(d.label)}${d.fresh==='expired'?' — do not fit as new':''}</p>`
+        : `<p class="mt-1.5 rounded-xl border border-zinc-800 bg-zinc-950/60 px-2.5 py-1.5 text-[11px] font-bold text-zinc-400">DOT ${esc(it.dot)} · not a valid date code</p>`;
+    })():''}
     <p class="mt-1 text-[12px] font-medium text-zinc-500">Supplier: <span class="font-semibold text-zinc-300">${esc(it.supplier||'—')}</span> · Updated ${timeAgo(it.updatedAt)}</p>
     <button data-action="sell-item" data-id="${it.id}" class="press mt-3 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-amber-500 py-3.5 font-display text-[15px] font-bold text-zinc-950"><i data-lucide="shopping-cart" class="h-4 w-4"></i>Add to bill</button>
 
@@ -1837,22 +1916,33 @@ function histRows(){
   }));
 }
 function exportXLSX(kind){
-  if(typeof XLSX==='undefined'){ toast('Excel engine unavailable — use CSV','err'); return; }
   const rows = kind==='stock'?stockRows():histRows();
   if(!rows.length){ toast('Nothing to export','err'); return; }
-  const wb = XLSX.utils.book_new();
-  const ws = XLSX.utils.json_to_sheet(rows);
-  ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(12, k.length+2, ...rows.slice(0,50).map(r=>String(r[k]??'').length+1)) }));
-  XLSX.utils.book_append_sheet(wb, ws, kind==='stock'?'Stock':'Activity');
-  const summary = XLSX.utils.json_to_sheet([
-    {'TyreStock Pro':'Exported','':todayStr()},
-    {'TyreStock Pro':'Products','':state.items.length},
-    {'TyreStock Pro':'Total units','':state.items.reduce((s,i)=>s+i.qty,0)},
-    {'TyreStock Pro':'Stock value','':money(state.items.reduce((s,i)=>s+i.qty*(i.cost||0),0))},
-  ]);
-  XLSX.utils.book_append_sheet(wb, summary, 'Summary');
-  XLSX.writeFile(wb, `TyreStock_${kind}_${todayStr()}.xlsx`);
-  toast('Sheet downloaded');
+  const sh = shop();
+  if(typeof XLSX!=='undefined'){
+    try {
+      const wb = XLSX.utils.book_new();
+      const ws = XLSX.utils.json_to_sheet(rows);
+      ws['!cols'] = Object.keys(rows[0]).map(k=>({wch: Math.max(12, k.length+2, ...rows.slice(0,50).map(r=>String(r[k]??'').length+1)) }));
+      XLSX.utils.book_append_sheet(wb, ws, kind==='stock'?'Stock':'Activity');
+      const summary = XLSX.utils.json_to_sheet([
+        {[sh.name]:'Exported','':todayStr()},
+        {[sh.name]:'Products','':state.items.length},
+        {[sh.name]:'Total units','':state.items.reduce((s,i)=>s+i.qty,0)},
+        {[sh.name]:'Stock value','':money(state.items.reduce((s,i)=>s+i.qty*(i.cost||0),0))},
+      ]);
+      XLSX.utils.book_append_sheet(wb, summary, 'Summary');
+      XLSX.writeFile(wb, `KaviTyre_${kind}_${todayStr()}.xlsx`);
+      toast('Sheet downloaded');
+      return;
+    } catch(err) {
+      download(`KaviTyre_${kind}_${todayStr()}.csv`, toCSV(rows), 'text/csv');
+      toast('Excel export failed — downloaded CSV instead');
+      return;
+    }
+  }
+  download(`KaviTyre_${kind}_${todayStr()}.csv`, toCSV(rows), 'text/csv');
+  toast('CSV downloaded');
 }
 function toCSV(rows){
   const keys = Object.keys(rows[0]);
@@ -1885,9 +1975,10 @@ function importJSON(file){
       state.expenses = Array.isArray(d.expenses)?d.expenses:[];
       if(Array.isArray(d.services)&&d.services.length) state.services=d.services;
       if(d.settings) state.settings = Object.assign({currency:'Rs', invSeq:0}, d.settings);
-      state.settings.shop = Object.assign({name:'Kavi Tyre Trading',address:'',phone:'',wacode:'94',prefix:'KATT',footer:'Thank you for your business!'}, state.settings.shop||{});
-      if(state.settings.shop.prefix==='KTT') state.settings.shop.prefix='KATT';
-      save(); renderDashboard(); renderStockList(); renderHistory(); renderRecentBrands(); renderSales(); fillShopForm(); updateCartBadge();
+      normalizeState();
+      save(); renderDashboard(); renderStockList(); renderHistory(); renderRecentBrands(); renderSales();
+      renderServices(); renderExpenses(); renderOptionManager(); renderCatChips(); renderTypeChips();
+      fillShopForm(); updateCartBadge();
       toast('Backup restored');
     }catch(e){ toast('Invalid backup file','err'); }
   };
@@ -1901,7 +1992,12 @@ document.addEventListener('click', e=>{
   const a = el.dataset.action, id = el.dataset.id;
 
   switch(a){
-    case 'tab':        setView(el.dataset.view); break;
+    case 'tab':
+      /* the More / settings area is password-protected — everything a staff
+         member needs daily (stock, POS, bills, scanner) stays freely open */
+      if(el.dataset.view==='data' && !isUnlocked()){ openLockSheet('data'); break; }
+      setView(el.dataset.view);
+      break;
     case 'filter':     setFilter(el.dataset.f); break;
     case 'filter-brand': {
       const b=decodeURIComponent(el.dataset.v);
@@ -1911,6 +2007,7 @@ document.addEventListener('click', e=>{
     }
     case 'clear-query':  clearQuery(); break;
     case 'reset-search': clearQuery(); setFilter('all'); break;
+    case 'stock-more':   stockLimit+=60; renderStockList(); break;
     case 'hfilter':    setHFilter(el.dataset.f); break;
     case 'goto-low':   setView('stock'); setFilter('low'); break;
     case 'low-bell':   setView('stock'); setFilter('low'); toast('Showing items that need restocking','info'); break;
@@ -2099,6 +2196,8 @@ document.addEventListener('click', e=>{
     case 'import-json': $('import-file').click(); break;
     case 'clear-all':      openEraseSheet(); break;
     case 'erase-confirm': confirmErase(); break;
+    case 'lock-confirm':  confirmUnlock(); break;
+    case 'lock-again':    lockedUntil=0; openLockSheet('data'); break;
     case 'close-sheet': closeSheet(); break;
   }
 });
@@ -2164,9 +2263,14 @@ function fbPush(force){
   if(!FB.cloudKnown && !force) return;              // never blind-push before reading the cloud once
   FB.pushing=true; updateSyncBadge('syncing');
   const dev=(navigator.userAgent.match(/android|iphone|ipad|windows|mac|linux/i)||['device'])[0];
-  FB.ref.set(Object.assign(snapshot(), {device:dev}))
+  let payload;
+  try{ payload=stripUndef(Object.assign(snapshot(), {device:dev})); }
+  catch(e){ FB.pushing=false; setSyncStatus('error'); return; }
+  FB.ref.set(payload)
     .then(()=>{ FB.pushing=false; FB.cloudKnown=true; setSyncStatus('synced'); })
-    .catch(()=>{ FB.pushing=false; setSyncStatus('error'); });
+    .catch(err=>{ FB.pushing=false; setSyncStatus('error');
+      console.warn('Cloud push failed:', err && err.message);
+      setTimeout(()=>{ if(FB.connected && !FB.pushing) fbPush(force); }, 15000); });   // auto-retry
 }
 function dataFreshness(o){
   const a=o.items||[], t=o.txns||[], s=o.sales||[];
@@ -2194,15 +2298,21 @@ function forcePullCloud(){
 }
 function applyRemote(d){
   state.items=d.items||[]; state.txns=d.txns||[]; state.sales=d.sales||[]; state.expenses=d.expenses||[];
-  state.services=(d.services&&d.services.length)?d.services:(state.services.length?state.services:DEFAULT_SERVICES.slice());
-  const sh=Object.assign({name:'Kavi Tyre Trading',address:'',phone:'',wacode:'94',prefix:'KATT',footer:'Thank you for your business!'},(d.settings&&d.settings.shop)||{});
-  if(sh.prefix==='KTT') sh.prefix='KATT';
-  state.settings=Object.assign({currency:'Rs',invSeq:0},d.settings||{},{shop:sh});
-  state.items.forEach(migrateItem);
+  if(Array.isArray(d.services)) state.services=d.services;     // empty list stays empty
+  state.settings=Object.assign({currency:'Rs',invSeq:0},d.settings||{});
+  normalizeState();
   saveLocalOnly(); setSyncStatus('synced');
-  renderDashboard(); renderStockList(); renderHistory(); renderSales(); renderRecentBrands(); fillShopForm(); updateCartBadge();
+  /* never wipe out what the user is typing: if a field is in use, skip the
+     re-render of that screen — the data is already in state and will show
+     next time they visit it */
+  const ae=document.activeElement;
+  const typing = ae && (ae.tagName==='INPUT'||ae.tagName==='TEXTAREA');
+  const posTyping  = typing && $('pos-root')   && $('pos-root').contains(ae);
+  const shopTyping = typing && $('view-data')  && $('view-data').contains(ae);
+  renderDashboard(); renderStockList(); renderHistory(); renderSales(); renderRecentBrands(); updateCartBadge();
   renderCatChips(); renderTypeChips(); renderOptionManager();
-  if(state.ui.view==='pos') renderPOS();
+  if(!shopTyping) fillShopForm();
+  if(state.ui.view==='pos' && !posTyping) renderPOS();
 }
 /* first launch: restore from the cloud if it has data, otherwise start a clean empty shop */
 function fbFirstPull(){
@@ -2526,6 +2636,10 @@ async function getOcrWorker(){
   try{ await w.setParameters({tessedit_pageseg_mode:'11'}); }catch(e){}
   SCAN.worker=w; return w;
 }
+/* release mobile GPU canvas memory immediately to prevent Safari/Chrome memory crashes */
+function disposeCanvas(c){
+  if(c && c.width){ try{ c.width=1; c.height=1; const ctx=c.getContext('2d'); if(ctx) ctx.clearRect(0,0,1,1); }catch(e){} }
+}
 /* crop helper — a zoomed centre band reads small sidewall text far better */
 function cropCanvas(src, x, y, w, h, scaleUp){
   const sx=Math.max(0,Math.round(src.width*x)), sy=Math.max(0,Math.round(src.height*y));
@@ -2547,7 +2661,9 @@ async function ocrDocLines(base){
     const [psm,mode]=plan[i];
     setProgress(15+i*(78/plan.length), `AI reading document… pass ${i+1}/${plan.length}`);
     try{ await worker.setParameters({tessedit_pageseg_mode:psm}); }catch(e){}
-    const out=await worker.recognize(enhance(wide, mode));
+    const cv = enhance(wide, mode);
+    const out = await worker.recognize(cv);
+    disposeCanvas(cv);
     const d=(out&&out.data)||{};
     let pass=[];
     if(d.lines && d.lines.length) pass = d.lines.map(l=>(l.text||'').replace(/\s+/g,' ').trim()).filter(Boolean);
@@ -2556,6 +2672,7 @@ async function ocrDocLines(base){
     got = pass.filter(l=>findSizes(l).length).length;
     if(got>=3) break;                    // enough tyre rows found — stop early
   }
+  disposeCanvas(wide);
   try{ await worker.setParameters({tessedit_pageseg_mode:'11'}); }catch(e){}
   return lines;
 }
@@ -2599,6 +2716,7 @@ async function runOcrOn(base){
   for(SCAN.passIdx=0; SCAN.passIdx<OCR_PASSES.length; SCAN.passIdx++){
     const cv=enhance(views[SCAN.passIdx]||base, OCR_PASSES[SCAN.passIdx]);
     const out=await worker.recognize(cv);
+    disposeCanvas(cv);
     const text=((out&&out.data&&out.data.text)||'').toUpperCase();
     const parsed=parseTyre(text);
     if(parsed.conf>agg.conf){ agg.brand=parsed.brand; agg.conf=parsed.conf; }
@@ -2610,6 +2728,8 @@ async function runOcrOn(base){
     agg.sizes.forEach(s=>{ const e=merged.get(s.size); if(e) e.score=Math.max(e.score,s.score); else merged.set(s.size,s); });
     agg.sizes=[...merged.values()];
   }
+  if(views[1]!==base) disposeCanvas(views[1]);
+  if(views[2]!==base) disposeCanvas(views[2]);
   const merged=new Map();
   agg.sizes.forEach(s=>{ const e=merged.get(s.size); if(e) e.score=Math.max(e.score,s.score); else merged.set(s.size,s); });
   agg.sizes=[...merged.values()].sort((a,b)=>b.score-a.score).slice(0,3);
@@ -2781,9 +2901,12 @@ async function ocrPdfPage(page, deep){
   let lines=[];
   for(const [psm,mode] of plan){
     try{ await worker.setParameters({tessedit_pageseg_mode:psm}); }catch(e){}
-    const out=await worker.recognize(enhance(c,mode));
+    const cv=enhance(c,mode);
+    const out=await worker.recognize(cv);
+    disposeCanvas(cv);
     lines=lines.concat(((out&&out.data&&out.data.text)||'').split('\n').map(s=>s.replace(/\s+/g,' ').trim()).filter(Boolean));
   }
+  disposeCanvas(c);
   try{ await worker.setParameters({tessedit_pageseg_mode:'11'}); }catch(e){}
   return lines;
 }
@@ -3267,10 +3390,25 @@ function renderPOS(){
 function posRenderResults(){
   const box=$('pos-results'); if(!box) return;
   const q=POS.q.trim().toLowerCase(), tokens=q.split(/\s+/).filter(Boolean);
-  let items=state.items.filter(i=>i.qty>0);
-  if(tokens.length) items=items.filter(i=>matchItem(i,tokens));
-  items=items.sort((a,b)=>b.updatedAt-a.updatedAt).slice(0, tokens.length?8:5);
-  box.innerHTML=items.length?items.map(it=>`
+
+  /* nothing typed → clean slate, no leftover "recent" list hanging around */
+  if(!tokens.length){
+    box.innerHTML=`
+      <div class="rounded-2xl border border-dashed border-zinc-800 p-6 text-center">
+        <i data-lucide="search" class="mx-auto h-6 w-6 text-zinc-600"></i>
+        <p class="mt-2 text-[12.5px] font-semibold text-zinc-400">Search a tyre to add it to the bill</p>
+        <p class="mt-0.5 text-[11px] font-medium text-zinc-600">Try ceat · 100x90x18 · r16 · michelin</p>
+      </div>`;
+    refreshIcons(); return;
+  }
+
+  const inCart = id => POS.lines.some(l=>l.kind!=='service' && l.itemId===id);
+  const matched = state.items.filter(i=>matchItem(i,tokens));
+  const hidden  = matched.filter(i=>inCart(i.id)).length;          // already added → out of the list
+  const items   = matched.filter(i=>i.qty>0 && !inCart(i.id))
+                         .sort((a,b)=>b.updatedAt-a.updatedAt).slice(0,10);
+
+  box.innerHTML = (items.length?items.map(it=>`
     <button data-action="pos-add" data-id="${it.id}" class="press flex w-full items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3 text-left">
       ${avatarHTML(it.brand,40)}
       <div class="min-w-0 flex-1">
@@ -3282,7 +3420,8 @@ function posRenderResults(){
         ${hasTwoPrices(it)?`<p class="tnum text-[10.5px] font-bold text-sky-300">low ${money(priceLow(it))}</p>`:`<p class="text-[10px] font-bold text-amber-400">Tap to add</p>`}
       </div>
     </button>`).join('')
-    : `<p class="rounded-2xl border border-dashed border-zinc-800 p-5 text-center text-[12px] font-medium text-zinc-500">${q?'No matching tyre in stock':'Search to add products'}</p>`;
+    : `<p class="rounded-2xl border border-dashed border-zinc-800 p-5 text-center text-[12px] font-medium text-zinc-500">${hidden?'Already added to the bill below':'No matching tyre in stock'}</p>`)
+    + (hidden?`<p class="flex items-center justify-center gap-1.5 pt-1 text-[11px] font-semibold text-emerald-300"><i data-lucide="check" class="h-3 w-3"></i>${hidden} match${hidden===1?'':'es'} already in the bill</p>`:'');
   refreshIcons();
 }
 function posRenderCart(){
@@ -3426,11 +3565,14 @@ function posRenderTotals(){
     <p class="mt-2 pb-2 text-center text-[11px] font-medium text-zinc-600">Stock is deducted automatically and logged in Activity.</p>`;
   refreshIcons();
 }
+let checkoutBusy=false;
 function posCheckout(){
+  if(checkoutBusy) return;                       // stops a double-tap making two invoices
   if(!POS.lines.length){ toast('Cart is empty','err'); return; }
   for(const l of POS.lines){ if(l.kind==='service') continue;
     const it=byId(l.itemId);
     if(!it||l.qty>it.qty){ toast(`Not enough stock for ${it?it.brand:'item'}`,'err'); return; } }
+  checkoutBusy=true; setTimeout(()=>{ checkoutBusy=false; }, 1500);
   const t=posTotals(), s=shop();
   state.settings.invSeq=(state.settings.invSeq||0)+1;
   const sale={ id:uid(), no:`${s.prefix||'KATT'}-${String(state.settings.invSeq).padStart(4,'0')}`, ts:Date.now(),
@@ -3457,6 +3599,9 @@ function posCheckout(){
 /* ── invoice output (A4 Formal & 58/80mm Thermal POS slip) ── */
 function invoiceHTML(sale, forPrint, format){
   const s=shop(), d=new Date(sale.ts);
+  if(!Array.isArray(sale.lines)) sale.lines=[];
+  if(!sale.cust || typeof sale.cust!=='object') sale.cust={};
+  const cust=sale.cust;
   const mode = format || (s.printer==='thermal'?'thermal':'a4');
   const C = state.settings.currency;
   const warr=[...new Set(sale.lines.map(l=>l.warranty).filter(Boolean))].join(', ');
@@ -3468,10 +3613,10 @@ function invoiceHTML(sale, forPrint, format){
       ${s.phone?`<div style="text-align:center;font-size:10.5px">Tel: ${esc(s.phone)}</div>`:''}
       <div style="border-top:1px dashed #000;margin:8px 0"></div>
       <div style="display:flex;justify-content:space-between"><span>INV: <b>${esc(sale.no)}</b></span><span>${d.toLocaleDateString('en-GB')} ${d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}</span></div>
-      ${sale.cust.name?`<div>Cust: ${esc(sale.cust.name)}</div>`:''}
-      ${sale.cust.phone?`<div>Tel: ${esc(sale.cust.phone)}</div>`:''}
-      ${sale.cust.vehicle?`<div>Veh: <b>${esc(sale.cust.vehicle)}</b></div>`:''}
-      <div>Pay: <b>${esc(sale.method)}</b></div>
+      ${cust.name?`<div>Cust: ${esc(cust.name)}</div>`:''}
+      ${cust.phone?`<div>Tel: ${esc(cust.phone)}</div>`:''}
+      ${cust.vehicle?`<div>Veh: <b>${esc(cust.vehicle)}</b></div>`:''}
+      <div>Pay: <b>${esc(sale.method||'Cash')}</b></div>
       <div style="border-top:1px dashed #000;margin:8px 0"></div>
       <table style="width:100%;border-collapse:collapse;font-size:11px">
         <thead><tr style="border-bottom:1px solid #000"><th style="text-align:left;padding:2px 0">Item</th><th style="text-align:center;width:28px">Qty</th><th style="text-align:right">Rate</th><th style="text-align:right">Amt</th></tr></thead>
@@ -3520,9 +3665,9 @@ function invoiceHTML(sale, forPrint, format){
     <div style="display:flex;justify-content:space-between;margin:10px 0 12px;font-size:11.5px">
       <div>
         <div style="color:#71717a;font-size:10px;text-transform:uppercase;letter-spacing:.08em">Bill to</div>
-        <div style="font-weight:700;font-size:13px">${esc(sale.cust.name||'Cash customer')}</div>
-        ${sale.cust.phone?`<div>${esc(sale.cust.phone)}</div>`:''}
-        ${sale.cust.vehicle?`<div>Vehicle: <b>${esc(sale.cust.vehicle)}</b></div>`:''}
+        <div style="font-weight:700;font-size:13px">${esc(cust.name||'Cash customer')}</div>
+        ${cust.phone?`<div>${esc(cust.phone)}</div>`:''}
+        ${cust.vehicle?`<div>Vehicle: <b>${esc(cust.vehicle)}</b></div>`:''}
       </div>
       <div style="text-align:right">
         <div style="color:#71717a;font-size:10px;text-transform:uppercase;letter-spacing:.08em">Payment Method</div>
@@ -3567,16 +3712,23 @@ function printInvoice(id, format){
   const s=shop();
   const mode = format || (sheetState&&sheetState.printMode) || s.printer || 'a4';
   $('print-area').innerHTML=invoiceHTML(sale, true, mode);
-  setTimeout(()=>{ window.print(); }, 120);
+  document.body.classList.toggle('print-thermal', mode==='thermal');
+  setTimeout(()=>{
+    window.print();
+    setTimeout(()=>document.body.classList.remove('print-thermal'), 800);
+  }, 120);
 }
 function billText(sale){
   const s=shop(), d=new Date(sale.ts), C=state.settings.currency;
+  if(!Array.isArray(sale.lines)) sale.lines=[];
+  if(!sale.cust || typeof sale.cust!=='object') sale.cust={};
+  const cust=sale.cust;
   let t=`*${s.name.toUpperCase()}*\n`;
   if(s.address) t+=`${s.address}\n`;
   if(s.phone) t+=`Tel: ${s.phone}\n`;
   t+=`\n*INVOICE ${sale.no}*\n${d.toLocaleDateString('en-GB')} ${d.toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'})}\n`;
-  if(sale.cust.name) t+=`Customer: ${sale.cust.name}\n`;
-  if(sale.cust.vehicle) t+=`Vehicle: ${sale.cust.vehicle}\n`;
+  if(cust.name) t+=`Customer: ${cust.name}\n`;
+  if(cust.vehicle) t+=`Vehicle: ${cust.vehicle}\n`;
   t+=`--------------------------------\n`;
   sale.lines.forEach((l,i)=>{
     const g=l.qty*l.price, d=l.discMode==='pct' ? g*Math.min(100,Math.max(0,l.disc||0))/100 : Math.min(Math.max(0,l.disc||0),g);
@@ -3603,6 +3755,7 @@ function waNumber(raw){
 }
 function sendWhatsApp(id){
   const sale=state.sales.find(x=>x.id===id); if(!sale) return;
+  if(!sale.cust || typeof sale.cust!=='object') sale.cust={};
   let num=waNumber(sale.cust.phone);
   if(!num){
     const p=prompt('Customer WhatsApp number:',''); if(!p) return;
@@ -3681,7 +3834,7 @@ function renderSales(){
         <button data-action="open-bill" data-id="${s.id}" class="press flex w-full items-center gap-3 rounded-2xl border border-zinc-800 bg-zinc-900/60 p-3 text-left">
           <div class="grid h-11 w-11 shrink-0 place-items-center rounded-2xl bg-amber-400/10 text-amber-400"><i data-lucide="receipt-text" class="h-5 w-5"></i></div>
           <div class="min-w-0 flex-1">
-            <p class="truncate text-[14px] font-bold">${esc(s.no)} <span class="font-medium text-zinc-400">· ${esc(s.cust.name||'Cash')}</span></p>
+            <p class="truncate text-[14px] font-bold">${esc(s.no)} <span class="font-medium text-zinc-400">· ${esc((s.cust&&s.cust.name)||'Cash')}</span></p>
             <p class="text-[11px] font-medium text-zinc-500">${s.lines.length} item${s.lines.length===1?'':'s'} · ${esc(s.method)} · ${timeAgo(s.ts)}</p>
           </div>
           <p class="tnum text-[15px] font-bold text-emerald-300">${money(s.total)}</p>
@@ -3696,24 +3849,37 @@ function renderSales(){
 }
 function exportSales(){
   const rows=[];
-  state.sales.forEach(s=>s.lines.forEach(l=>{
-    const svc=l.kind==='service', g=l.qty*l.price, d=l.discMode==='pct' ? g*Math.min(100,Math.max(0,l.disc||0))/100 : Math.min(Math.max(0,l.disc||0),g);
-    rows.push({
-      'Invoice':s.no,'Date':new Date(s.ts).toLocaleDateString('en-GB'),'Time':new Date(s.ts).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}),
-      'Customer':s.cust.name||'Cash','Phone':s.cust.phone||'','Vehicle':s.cust.vehicle||'',
-      'Kind':svc?'Service':'Tyre','Brand':svc?'':l.brand,'Item':svc?l.name:(l.pattern||''),'Size':svc?'':l.size,
-      'Price Type':svc?'':(l.mode==='low'?'Low':'High'),'Qty':l.qty,'Rate':l.price,
-      'Item Discount':d,'Item Disc Type':l.discMode==='pct'?'%':'Amount','Amount':g-d,
-      'Bill Discount':s.disc,'Bill Disc Type':s.discMode==='pct'?'%':'Amount','Bill Total':s.total,'Payment':s.method });
-  }));
+  state.sales.forEach(s=>{
+    if(!s || !Array.isArray(s.lines)) return;
+    const cust=s.cust||{};
+    s.lines.forEach(l=>{
+      const svc=l.kind==='service', g=l.qty*l.price, d=l.discMode==='pct' ? g*Math.min(100,Math.max(0,l.disc||0))/100 : Math.min(Math.max(0,l.disc||0),g);
+      rows.push({
+        'Invoice':s.no||'','Date':s.ts?new Date(s.ts).toLocaleDateString('en-GB'):'','Time':s.ts?new Date(s.ts).toLocaleTimeString('en-GB',{hour:'2-digit',minute:'2-digit'}):'',
+        'Customer':cust.name||'Cash','Phone':cust.phone||'','Vehicle':cust.vehicle||'',
+        'Kind':svc?'Service':'Tyre','Brand':svc?'':l.brand,'Item':svc?l.name:(l.pattern||''),'Size':svc?'':l.size,
+        'Price Type':svc?'':(l.mode==='low'?'Low':'High'),'Qty':l.qty||0,'Rate':l.price||0,
+        'Item Discount':d,'Item Disc Type':l.discMode==='pct'?'%':'Amount','Amount':g-d,
+        'Bill Discount':s.disc||0,'Bill Disc Type':s.discMode==='pct'?'%':'Amount','Bill Total':s.total||0,'Payment':s.method||'Cash' });
+    });
+  });
   if(!rows.length){ toast('No sales to export','err'); return; }
   if(typeof XLSX!=='undefined'){
-    const wb=XLSX.utils.book_new(), ws=XLSX.utils.json_to_sheet(rows);
-    ws['!cols']=Object.keys(rows[0]).map(k=>({wch:Math.max(11,k.length+2)}));
-    XLSX.utils.book_append_sheet(wb,ws,'Sales');
-    XLSX.writeFile(wb,`KaviTyre_sales_${todayStr()}.xlsx`);
-  } else download(`sales_${todayStr()}.csv`, toCSV(rows), 'text/csv');
-  toast('Sales sheet downloaded');
+    try {
+      const wb=XLSX.utils.book_new(), ws=XLSX.utils.json_to_sheet(rows);
+      ws['!cols']=Object.keys(rows[0]).map(k=>({wch:Math.max(11,k.length+2)}));
+      XLSX.utils.book_append_sheet(wb,ws,'Sales');
+      XLSX.writeFile(wb,`KaviTyre_sales_${todayStr()}.xlsx`);
+      toast('Sales sheet downloaded');
+      return;
+    } catch(err) {
+      download(`KaviTyre_sales_${todayStr()}.csv`, toCSV(rows), 'text/csv');
+      toast('Excel failed — downloaded CSV instead');
+      return;
+    }
+  }
+  download(`KaviTyre_sales_${todayStr()}.csv`, toCSV(rows), 'text/csv');
+  toast('Sales sheet downloaded (CSV)');
 }
 function renderServices(){
   const box=$('svc-list'); if(!box) return;
@@ -3769,6 +3935,47 @@ function fillShopForm(){
   const sb=$('sb-brand'); if(sb) sb.innerHTML=nm;
 }
 
+/* ── password gate for the More / settings area ── */
+function isUnlocked(){ return Date.now() < lockedUntil; }
+function openLockSheet(pendingView){
+  sheetState={kind:'lock', pendingView};
+  openSheet('Owner access', `
+    <div class="rounded-2xl border border-amber-400/25 bg-amber-400/10 p-4">
+      <p class="flex items-center gap-2 font-display text-[15px] font-bold text-amber-300"><i data-lucide="lock" class="h-5 w-5"></i>Restricted area</p>
+      <p class="mt-1.5 text-[12px] font-medium leading-relaxed text-zinc-400">Shop details, sheets, expenses, cloud tools and data erasing are protected. Enter the owner password to continue.</p>
+    </div>
+    <div class="mt-4">
+      <label class="mb-1.5 block text-xs font-semibold text-zinc-400">Owner password</label>
+      <input id="lock-pass" type="password" autocomplete="off" class="field" placeholder="Password" onkeydown="if(event.key==='Enter')confirmUnlock()">
+      <p id="lock-err" class="mt-2 hidden items-center gap-1.5 text-[12px] font-bold text-rose-300"><i data-lucide="shield-alert" class="h-3.5 w-3.5"></i>Wrong password — try again</p>
+    </div>
+    <button data-action="lock-confirm" class="press mt-4 flex w-full items-center justify-center gap-2 rounded-2xl bg-gradient-to-r from-amber-400 to-amber-500 py-4 font-display text-[16px] font-bold text-zinc-950 shadow-lg shadow-amber-500/20">
+      <i data-lucide="unlock" class="h-5 w-5"></i>Unlock
+    </button>
+    <p class="mt-2 pb-1 text-center text-[11px] font-medium text-zinc-600">Stays unlocked on this device for 10 minutes.</p>`);
+  setTimeout(()=>{ const p=$('lock-pass'); if(p) p.focus(); },380);
+}
+function confirmUnlock(){
+  const inp=$('lock-pass');
+  const val=inp? inp.value : '';
+  if(String(val).toLowerCase()!==OWNER_PASSWORD){
+    const err=$('lock-err');
+    if(err){ err.classList.remove('hidden'); err.classList.add('flex'); refreshIcons(); }
+    if(inp){
+      inp.classList.remove('shake'); void inp.offsetWidth; inp.classList.add('shake');
+      inp.value=''; inp.focus();
+    }
+    vib(50);
+    toast('Wrong password','err');
+    return;
+  }
+  lockedUntil = Date.now() + 10*60*1000;      // 10-minute unlock window
+  const target = sheetState && sheetState.pendingView;
+  closeSheet();
+  toast('Unlocked — More is open for 10 minutes');
+  if(target) setView(target);
+}
+
 /* ── password-protected erase ── */
 function openEraseSheet(){
   sheetState={kind:'erase'};
@@ -3791,7 +3998,7 @@ function openEraseSheet(){
 function confirmErase(){
   const inp=$('erase-pass');
   const val=inp? inp.value : '';
-  if(val!==ERASE_PASSWORD){
+  if(String(val).toLowerCase()!==OWNER_PASSWORD){
     const err=$('erase-err');
     if(err){ err.classList.remove('hidden'); err.classList.add('flex'); refreshIcons(); }
     if(inp){
@@ -3802,7 +4009,9 @@ function confirmErase(){
     toast('Wrong password','err');
     return;
   }
-  state.items=[]; state.txns=[]; state.sales=[]; state.expenses=[]; state.settings.invSeq=0;
+  /* invoice numbering keeps counting even after an erase — never reuse a number
+     that may already be on a printed bill */
+  state.items=[]; state.txns=[]; state.sales=[]; state.expenses=[];
   keepStockOrder=false; stockOrderIds=[];
   save();
   closeSheet();
@@ -3813,7 +4022,9 @@ function confirmErase(){
 
 /* ═══════════════════ DAILY EXPENSES & CASH DRAWER ═══════════════════ */
 function expAdd(){
-  const cat=$('exp-cat').value, amt=Math.max(0,parseFloat($('exp-amount').value)||0), note=$('exp-note').value.trim();
+  if(!$('exp-cat')||!$('exp-amount')) return;
+  const cat=$('exp-cat').value, amt=Math.max(0,parseFloat($('exp-amount').value)||0);
+  const note=$('exp-note')?$('exp-note').value.trim():'';
   if(!amt){ toast('Enter an amount','err'); return; }
   state.expenses.unshift({id:uid(), ts:Date.now(), cat, amount:amt, note});
   $('exp-amount').value=''; $('exp-note').value='';
@@ -3868,8 +4079,15 @@ function dayEndReport(){
   t+=`\nGross profit: ${C} ${num(Math.round(r.profit))}\n`;
   t+=`*NET AFTER EXPENSES: ${C} ${num(Math.round(r.profit-r.expenses))}*`;
   const num2=waNumber(sh.phone);
-  window.open(`https://wa.me/${num2||''}?text=${encodeURIComponent(t)}`,'_blank');
-  toast('Day-end report ready to send','info');
+  if(num2){
+    window.open(`https://wa.me/${num2}?text=${encodeURIComponent(t)}`,'_blank');
+    toast('Day-end report ready to send','info');
+  } else {
+    /* no shop number set → use the phone share sheet or copy instead */
+    if(navigator.share){ navigator.share({title:'Day-end report', text:t}).catch(()=>{}); }
+    else if(navigator.clipboard){ navigator.clipboard.writeText(t); toast('Day-end report copied'); }
+    else toast('Add your shop phone in More to send by WhatsApp','info');
+  }
 }
 
 /* ═══════════════════ INCOME REPORTS (month / year / all) ═══════════════════ */
@@ -3877,8 +4095,9 @@ let RPT = { mode:'month', ym:'', year:'' };
 function ymKey(ts){ const d=new Date(ts); return d.getFullYear()+'-'+String(d.getMonth()+1).padStart(2,'0'); }
 function ymLabel(k){ const [y,m]=k.split('-'); return new Date(+y,+m-1,1).toLocaleDateString('en-GB',{month:'long',year:'numeric'}); }
 function periodsAvailable(){
-  const set=new Set(state.sales.map(s=>ymKey(s.ts)));
-  state.expenses.forEach(e=>set.add(ymKey(e.ts)));
+  const set=new Set();
+  state.sales.forEach(s=>{ if(s && s.ts && isFinite(s.ts)) set.add(ymKey(s.ts)); });
+  state.expenses.forEach(e=>{ if(e && e.ts && isFinite(e.ts)) set.add(ymKey(e.ts)); });
   return [...set].sort().reverse();
 }
 function yearsAvailable(){
@@ -3919,18 +4138,21 @@ function saleLineRows(sale){
   return rows;
 }
 function buildReport(from,to){
-  const sales=state.sales.filter(s=>s.ts>=from && s.ts<to).sort((a,b)=>a.ts-b.ts);
-  const exps=state.expenses.filter(e=>e.ts>=from && e.ts<to);
+  /* one broken record must never kill the whole report */
+  const sales=state.sales.filter(s=>s && s.ts && isFinite(s.ts) && s.ts>=from && s.ts<to && Array.isArray(s.lines))
+                         .sort((a,b)=>a.ts-b.ts);
+  const exps=state.expenses.filter(e=>e && e.ts && isFinite(e.ts) && e.ts>=from && e.ts<to);
   const R={ sales, gross:0, itemDisc:0, billDisc:0, net:0, cost:0, profit:0, units:0,
-            bills:sales.length, expenses:exps.reduce((a,b)=>a+b.amount,0), exps,
+            bills:sales.length, expenses:exps.reduce((a,b)=>a+(+b.amount||0),0), exps,
             cat:{}, brand:{}, vtype:{}, svc:{}, day:{}, month:{}, pay:{}, cust:{}, prod:{}, lines:[] };
   sales.forEach(sale=>{
     const rows=saleLineRows(sale);
-    R.pay[sale.method]=R.pay[sale.method]||{bills:0,amount:0};
-    R.pay[sale.method].bills++; R.pay[sale.method].amount+=sale.total;
+    const pm=sale.method||'Other', tot=+sale.total||0;
+    R.pay[pm]=R.pay[pm]||{bills:0,amount:0};
+    R.pay[pm].bills++; R.pay[pm].amount+=tot;
     const cname=(sale.cust&&sale.cust.name)||'Cash customer';
     R.cust[cname]=R.cust[cname]||{bills:0,amount:0,phone:(sale.cust&&sale.cust.phone)||'',vehicle:(sale.cust&&sale.cust.vehicle)||''};
-    R.cust[cname].bills++; R.cust[cname].amount+=sale.total;
+    R.cust[cname].bills++; R.cust[cname].amount+=tot;
     const dk=new Date(sale.ts).toISOString().slice(0,10), mk=ymKey(sale.ts);
     R.day[dk]=R.day[dk]||{bills:0,units:0,gross:0,disc:0,net:0,cost:0,profit:0};
     R.month[mk]=R.month[mk]||{bills:0,units:0,gross:0,disc:0,net:0,cost:0,profit:0};
@@ -4124,14 +4346,24 @@ function exportReportXLSX(){
     'Supplier':i.supplier||'','Country':i.country||'','Warranty':i.warranty||'','DOT':i.dot||'' })));
 
   const fname=`KaviTyre_Income_${label.replace(/[^A-Za-z0-9]+/g,'_')}.xlsx`;
-  XLSX.writeFile(wb, fname);
-  toast('Report downloaded — 14 sheets');
+  try {
+    XLSX.writeFile(wb, fname);
+    toast('Report downloaded — 14 sheets');
+  } catch(err) {
+    try {
+      const wbout = XLSX.write(wb, { bookType:'xlsx', type:'array' });
+      download(fname, wbout, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+      toast('Report downloaded — 14 sheets');
+    } catch(err2) {
+      toast('Could not download Excel workbook: ' + (err2.message||'storage error'), 'err');
+    }
+  }
 }
 
 /* ═══════════════════════ INIT ═══════════════════════ */
 function init(){
   const had = load();
-  if(!state.services.length) state.services=DEFAULT_SERVICES.slice();
+  normalizeState();
   fbInit();
 
   $('import-file').addEventListener('change', e=>{ if(e.target.files[0]) importJSON(e.target.files[0]); e.target.value=''; });
@@ -4170,11 +4402,18 @@ function init(){
   renderCatChips();
   renderOptionManager();
   renderRecentBrands();
+  renderServices();
+  renderExpenses();
   fillShopForm();
   updateCartBadge();
   $('pref-currency').value = state.settings.currency;
   setView('dashboard');
   refreshIcons();
+  /* never lose a sale: flush pending cloud writes before the tab closes */
+  window.addEventListener('beforeunload', ()=>{ try{ saveLocalOnly(); }catch(e){} });
+  document.addEventListener('visibilitychange', ()=>{
+    if(document.visibilityState==='visible' && FB.ref && FB.connected) fbPull();
+  });
   if(!had) fbFirstPull(); else fbPull();
 }
 document.addEventListener('DOMContentLoaded', init);
